@@ -1,0 +1,256 @@
+import cv2
+import numpy as np
+import requests
+import json
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import pickle
+import os
+from typing import List, Dict, Tuple
+
+
+class LightweightFoodRecognizer:
+    def __init__(self):
+        # Initialize models and databases
+        self.nutrition_db = self._load_nutrition_database()
+        self.reference_objects = {'fork': 18.0, 'spoon': 15.0, 'credit_card': 85.6}  # cm
+
+        # Try to load pre-trained models
+        self.detector = self._load_detector()
+        self.classifier = self._load_classifier()
+
+    def _load_detector(self):
+        """Load pre-trained OpenCV detector"""
+        # Try Haar Cascade first (included with OpenCV)
+        cascade_path = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
+        if os.path.exists(cascade_path):
+            return cv2.CascadeClassifier(cascade_path)
+
+        # Fallback to simple color-based detection
+        return None
+
+    def _load_classifier(self):
+        """Load pre-trained KNN classifier"""
+        try:
+            if os.path.exists('food_classifier.pkl'):
+                with open('food_classifier.pkl', 'rb') as f:
+                    return pickle.load(f)
+            return None
+        except:
+            return None
+
+    def _load_nutrition_database(self) -> Dict:
+        """Load simplified nutrition database"""
+        basic_db = {
+            'apple': {'calories': 52, 'protein': 0.3, 'carbs': 14, 'fat': 0.2, 'density': 0.85},
+            'banana': {'calories': 89, 'protein': 1.1, 'carbs': 23, 'fat': 0.3, 'density': 0.94},
+            'pizza': {'calories': 266, 'protein': 11, 'carbs': 33, 'fat': 10, 'density': 0.7},
+            'salad': {'calories': 15, 'protein': 1, 'carbs': 3, 'fat': 0, 'density': 0.5},
+            'chicken': {'calories': 239, 'protein': 27, 'carbs': 0, 'fat': 14, 'density': 1.05}
+        }
+
+        try:
+            with open('nutrition_db.json') as f:
+                custom_db = json.load(f)
+            basic_db.update(custom_db)
+        except:
+            pass
+
+        return basic_db
+
+    def detect_food_regions(self, image: np.ndarray) -> List[Tuple]:
+        """Detect potential food regions using color and texture"""
+        # Convert to HSV color space
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        # Simple color thresholding for food-like colors
+        lower = np.array([0, 30, 30])
+        upper = np.array([50, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Filter small regions
+        min_area = image.shape[0] * image.shape[1] * 0.01  # 1% of image area
+        regions = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) > min_area:
+                x, y, w, h = cv2.boundingRect(cnt)
+                regions.append((x, y, w, h))
+
+        return regions
+
+    def extract_features(self, image: np.ndarray) -> np.ndarray:
+        """Extract simple color and texture features"""
+        # Color histogram (HSV)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hist_h = cv2.calcHist([hsv], [0], None, [8], [0, 180])
+        hist_s = cv2.calcHist([hsv], [1], None, [4], [0, 256])
+        hist_v = cv2.calcHist([hsv], [2], None, [4], [0, 256])
+
+        # Texture (LBP)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        lbp = self._local_binary_pattern(gray)
+        hist_lbp = np.histogram(lbp, bins=8, range=(0, 256))[0]
+
+        # Combine features
+        features = np.concatenate([
+            hist_h.flatten(),
+            hist_s.flatten(),
+            hist_v.flatten(),
+            hist_lbp.flatten()
+        ])
+
+        return features
+
+    def _local_binary_pattern(self, image: np.ndarray, radius=1, neighbors=8) -> np.ndarray:
+        """Simple LBP implementation"""
+        lbp = np.zeros_like(image)
+        for i in range(radius, image.shape[0] - radius):
+            for j in range(radius, image.shape[1] - radius):
+                center = image[i, j]
+                binary = []
+                for k in range(neighbors):
+                    angle = 2 * np.pi * k / neighbors
+                    x = i + int(round(radius * np.cos(angle)))
+                    y = j + int(round(radius * np.sin(angle)))
+                    binary.append(1 if image[x, y] >= center else 0)
+                lbp[i, j] = sum([b * (2 ** n) for n, b in enumerate(binary)])
+        return lbp
+
+    def classify_food(self, image: np.ndarray) -> str:
+        """Classify food using KNN or color matching"""
+        if self.classifier:
+            features = self.extract_features(image).reshape(1, -1)
+            pred_idx = self.classifier.predict(features)[0]
+            return list(self.nutrition_db.keys())[pred_idx]
+        else:
+            # Fallback to simple color matching
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            avg_color = np.mean(hsv, axis=(0, 1))
+
+            # Find closest matching food by color
+            min_dist = float('inf')
+            best_match = 'unknown'
+            for food, data in self.nutrition_db.items():
+                # Simple color ranges for demo
+                if food == 'apple' and 10 < avg_color[0] < 30 and avg_color[1] > 50:
+                    return 'apple'
+                elif food == 'banana' and 20 < avg_color[0] < 40 and avg_color[1] > 60:
+                    return 'banana'
+                elif food == 'pizza' and avg_color[1] > 40 and avg_color[2] > 100:
+                    return 'pizza'
+
+            return 'unknown'
+
+    def estimate_portion(self, image: np.ndarray, reference: str = None) -> float:
+        """Simple portion estimation based on area and reference"""
+        # Calculate area in pixels
+        area = image.shape[0] * image.shape[1]
+
+        # Convert to cm² if reference object provided
+        if reference and reference in self.reference_objects:
+            ref_length_px = min(image.shape[:2]) * 0.2  # Assume reference is 20% of image
+            ref_length_cm = self.reference_objects[reference]
+            px_per_cm = ref_length_px / ref_length_cm
+            area_cm = area / (px_per_cm ** 2)
+        else:
+            area_cm = area / 1000  # Arbitrary scaling
+
+        # Simple weight estimation using density
+        food_type = self.classify_food(image)
+        density = self.nutrition_db.get(food_type, {}).get('density', 1.0)
+        height_estimate = 2.0  # cm (average food height assumption)
+        volume = area_cm * height_estimate
+        weight = volume * density
+
+        return weight
+
+    def calculate_calories(self, food_name: str, weight: float) -> float:
+        """Calculate calories based on food type and weight"""
+        food_data = self.nutrition_db.get(food_name, {})
+        if not food_data:
+            return 0.0
+
+        calories_per_gram = food_data['calories'] / 100  # per 100g
+        return calories_per_gram * weight
+
+    def analyze_meal(self, image_path: str) -> Dict:
+        """Complete meal analysis pipeline"""
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError("Could not read image")
+
+        # Detect food regions
+        regions = self.detect_food_regions(image)
+
+        results = {
+            'total_calories': 0,
+            'food_items': [],
+            'nutrition_summary': {
+                'protein': 0,
+                'carbs': 0,
+                'fat': 0
+            }
+        }
+
+        for x, y, w, h in regions:
+            cropped = image[y:y + h, x:x + w]
+
+            # Classify food
+            food_type = self.classify_food(cropped)
+
+            # Estimate portion
+            weight = self.estimate_portion(cropped)
+
+            # Nutrition calculation
+            calories = self.calculate_calories(food_type, weight)
+            food_data = self.nutrition_db.get(food_type, {})
+
+            # Update results
+            results['total_calories'] += calories
+            if food_data:
+                results['nutrition_summary']['protein'] += food_data['protein'] * weight / 100
+                results['nutrition_summary']['carbs'] += food_data['carbs'] * weight / 100
+                results['nutrition_summary']['fat'] += food_data['fat'] * weight / 100
+
+            results['food_items'].append({
+                'name': food_type,
+                'weight_g': weight,
+                'calories': calories,
+                'region': (x, y, w, h)
+            })
+
+        return results
+
+
+# Example usage
+if __name__ == "__main__":
+    print("Initializing lightweight food recognizer...")
+    recognizer = LightweightFoodRecognizer()
+
+    # Analyze a meal image (replace with your image path)
+    image_path = "simple_meal.jpg"  # Try with an image containing clear food items
+
+    if not os.path.exists(image_path):
+        # Create a demo image if none exists
+        demo_image = np.zeros((300, 400, 3), dtype=np.uint8)
+        cv2.rectangle(demo_image, (50, 50), (150, 200), (0, 100, 255), -1)  # Orange rectangle (carrot)
+        cv2.rectangle(demo_image, (200, 100), (350, 250), (200, 200, 100), -1)  # Brown rectangle (bread)
+        cv2.imwrite(image_path, demo_image)
+        print(f"Created demo image at {image_path}")
+
+    results = recognizer.analyze_meal(image_path)
+
+    print("\nMeal Analysis Results:")
+    print(f"Total Calories: {results['total_calories']:.2f}")
+    print("Nutrition Summary:")
+    print(f"Protein: {results['nutrition_summary']['protein']:.2f}g")
+    print(f"Carbs: {results['nutrition_summary']['carbs']:.2f}g")
+    print(f"Fat: {results['nutrition_summary']['fat']:.2f}g")
+
+    print("\nDetected Food Items:")
+    for item in results['food_items']:
+        print(f"- {item['name']}: {item['weight_g']:.2f}g, {item['calories']:.2f} kcal")
